@@ -1,0 +1,4 @@
+Model,HR@15,MRR@15,SemanticNDCG@15,Queries evaluated
+VibeMatcher (Semantic + Genre + Mood),0.52,0.224,0.8147,25
+TF-IDF Baseline,0.28,0.1247,0.4791,25
+Popularity Baseline,0.0,0.0,0.2918,25
