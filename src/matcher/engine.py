@@ -184,39 +184,68 @@ class QueryEngine:
             return None
         return sum(labels) >= len(labels) / 2
 
-    def _explain(
+    def _explain_batch(
         self,
         source_titles: list[str],
         source_domain: str,
-        rec_title:     str,
-        rec_domain:    str,
-        rec_text:      str,
-        similarity:    float,
-    ) -> str:
+        candidates:    list[dict],  # list of {"title": str, "domain": str, "text": str}
+    ) -> dict[str, str]:
         """
-        Calls Gemini to generate a single-sentence explanation of why
-        ``rec_title`` suits a fan of ``source_titles``.
+        Single Gemini call for ALL recommendations at once.
+        Returns a dict mapping rec_title -> one-sentence explanation.
         Retries up to 3 times with exponential back-off on failure.
         """
+        import json
+
+        entries = "\n".join(
+            f"{i+1}. \"{c['title']}\" ({c['domain']}): {c['text'][:300]}"
+            for i, c in enumerate(candidates)
+        )
         prompt = (
-            f"A user likes the following {source_domain}(s): {', '.join(source_titles)}.\n"
-            f"The system recommends the {rec_domain} '{rec_title}'.\n\n"
-            f"Here is a brief description of '{rec_title}':\n{rec_text[:400]}\n\n"
-            f"In exactly one sentence (max 30 words), explain why a fan of "
-            f"{', '.join(source_titles)} would enjoy '{rec_title}'. "
-            f"Be specific about shared themes, tone, or atmosphere."
+            f"A user likes the following {source_domain}(s): {', '.join(source_titles)}.\n\n"
+            f"The system recommends these titles:\n{entries}\n\n"
+            f"For each recommended title, write exactly one sentence (max 30 words) explaining "
+            f"why a fan of {', '.join(source_titles)} would enjoy it. "
+            f"Be specific about shared themes, tone, or atmosphere.\n\n"
+            f"Respond ONLY with a valid JSON object where each key is the exact title string "
+            f"and the value is the one-sentence explanation. No markdown, no preamble."
         )
         llm = self._get_llm()
+        from google.genai import types as _genai_types
+
+        config = _genai_types.GenerateContentConfig(
+            response_mime_type="application/json",
+            max_output_tokens=2048,
+        )
+
         for attempt in range(3):
             try:
-                time.sleep(4)
-                response = llm.models.generate_content(model=GEMINI_MODEL_NAME, contents=prompt)
-                return response.text.strip()
+                response = llm.models.generate_content(
+                    model=GEMINI_MODEL_NAME,
+                    contents=prompt,
+                    config=config,
+                )
+                raw = (response.text or "").strip()
+                # Belt-and-braces: still strip stray markdown fences if the
+                # model ever ignores response_mime_type.
+                if raw.startswith("```"):
+                    raw = raw.split("```")[1]
+                    if raw.startswith("json"):
+                        raw = raw[4:]
+                if not raw:
+                    raise ValueError("Empty response body from Gemini")
+                return json.loads(raw)
             except Exception as exc:
                 wait = 30 * (attempt + 1)
-                print(f"  Gemini error (attempt {attempt + 1}/3): {exc} — retrying in {wait}s")
-                time.sleep(wait)
-        return "(explanation unavailable)"
+                print(f"  Gemini batch error (attempt {attempt + 1}/3): {exc} — retrying in {wait}s")
+                if attempt < 2:
+                    time.sleep(wait)
+        # Fallback: surface the failure instead of hiding it
+        print(
+            f"  [explain] Gave up after 3 attempts for {len(candidates)} candidates — "
+            "explanations will show as unavailable in the UI."
+        )
+        return {c["title"]: "(explanation unavailable)" for c in candidates}
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -342,30 +371,52 @@ class QueryEngine:
         final_top = cand_meta.sort_values("score", ascending=False).head(top_k)
 
         result_rows: list[dict] = []
+        # ── Batch explanations: 1 Gemini call for all results ────────────────
+        explanations: dict[str, str] = {}
+        if explain:
+            candidates = [
+                {
+                    "title":  row["title"],
+                    "domain": target_domain,
+                    "text":   row.get("aggregated_text", ""),
+                }
+                for _, row in final_top.iterrows()
+            ]
+            explanations = self._explain_batch(
+                source_titles=titles,
+                source_domain=source_domain,
+                candidates=candidates,
+            )
+
         for rank, (_, row) in enumerate(final_top.iterrows(), start=1):
             sim = round(float(row["score"]), 4)
             sent_ok = (bool(row["sentiment"]) == query_pol if query_pol is not None else None)
 
-            explanation = ""
-            if explain:
-                explanation = self._explain(
-                    source_titles=titles,
-                    source_domain=source_domain,
-                    rec_title=row["title"],
-                    rec_domain=target_domain,
-                    rec_text=row.get("aggregated_text", ""),
-                    similarity=sim,
-                )
+            # Ensure genres/moods are always a clean list of plain strings.
+            # Guard against index versions that stored pre-rendered HTML fragments.
+            raw_genres = row.get("genres", [])
+            genres_clean = (
+                [str(g) for g in raw_genres if isinstance(g, str) and "<" not in g and g.strip()]
+                if isinstance(raw_genres, (list, tuple))
+                else []
+            )
+
+            raw_moods = row.get("mood_tags", [])
+            moods_clean = (
+                [str(m) for m in raw_moods if isinstance(m, str) and "<" not in m and m.strip()]
+                if isinstance(raw_moods, (list, tuple))
+                else []
+            )
 
             result_rows.append({
                 "rank":            rank,
                 "title":           row["title"],
                 "domain":          target_domain,
                 "similarity":      sim,
-                "genres":          row.get("genres", []),
-                "mood_tags":       row.get("mood_tags", []),
+                "genres":          genres_clean,
+                "mood_tags":       moods_clean,
                 "sentiment_match": sent_ok,
-                "explanation":     explanation,
+                "explanation":     explanations.get(row["title"], ""),
             })
 
         return pd.DataFrame(result_rows)

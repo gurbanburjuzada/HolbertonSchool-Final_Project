@@ -5,6 +5,7 @@ sentence-transformers>=2.7.0
 numpy>=1.26.0
 pandas>=2.0.0
 scikit-learn>=1.4.0   # pulled in by sentence-transformers; listed explicitly for clarity
+huggingface_hub>=0.23.0   # downloads the prebuilt index from a HF Dataset repo
 
 # Streamlit frontend
 streamlit>=1.35.0
@@ -14,5 +15,5 @@ python-dotenv>=1.0.0
 
 # Gemini (optional — only needed when explain=True)
 # google-generativeai is deprecated; use google-genai instead.
-google-genai==2.8.0
+google-genai>=1.0.0
 certifi>=2024.0.0

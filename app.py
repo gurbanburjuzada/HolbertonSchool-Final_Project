@@ -6,22 +6,39 @@ Run from the Holberton_Final/ directory:
 """
 from __future__ import annotations
 
+# ── SSL fix: force Python to use certifi's certificate bundle instead of the
+# OS cert store, which can be broken/incomplete on some Windows setups and
+# causes "[ASN1: NOT_ENOUGH_DATA]" errors when connecting to the Gemini API.
+# Fix: explicitly overwrite these vars whenever they're missing OR empty.
+
+import os
+import certifi
 import sys
+import pandas as pd
 import streamlit as st
 from pathlib import Path
 from src.matcher.engine import QueryEngine
 from src.matcher.config import INDEX_DIR, GEMINI_API_KEY
+from src.matcher.index_download import ensure_index_files
 
-# ── SSL fix: force Python to use certifi's certificate bundle instead of the
-# OS cert store, which can be broken/incomplete on some Windows setups and
-# causes "[ASN1: NOT_ENOUGH_DATA]" errors when connecting to the Gemini API.
-import os
-import certifi
-os.environ.setdefault("SSL_CERT_FILE", certifi.where())
-os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+_CERT_BUNDLE = certifi.where()
+for _var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+    if not os.environ.get(_var):          # catches both unset AND ""
+        os.environ[_var] = _CERT_BUNDLE
+
+# SSL_CERT_DIR="" (empty capath) triggers its own SSL error
+# ([X509: INVALID_DIRECTORY]), so just drop it if it's empty.
+if os.environ.get("SSL_CERT_DIR") == "":
+    del os.environ["SSL_CERT_DIR"]
+
 
 # Ensure src/ is importable when invoked as: streamlit run app.py
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# ── Index files: download from HF Dataset (HF_INDEX_REPO) if not already
+# present locally. No-op if index/ already has the 4 required files
+# (e.g. local development). See src/matcher/index_download.py for setup.
+ensure_index_files()
 
 
 # ── Page config (MUST be first Streamlit call) ────────────────────────────────
@@ -202,22 +219,57 @@ def load_engine() -> QueryEngine:
 
 
 # ── Result card ───────────────────────────────────────────────────────────────
+def _safe_list(val) -> list[str]:
+    """Return a clean list of plain strings from any genre/mood value.
+
+    Handles: None, empty string, proper list, numpy array, stringified list
+    (e.g. "['fantasy', 'sci-fi']"), and silently drops any item that contains
+    HTML markup so a stale index with pre-rendered HTML fragments never leaks
+    into the UI.
+    """
+    import ast as _ast
+    if val is None:
+        return []
+    # String — could be a stringified list or a single genre name
+    if isinstance(val, str):
+        val = val.strip()
+        if not val or val.lower() in ("nan", "none", "[]"):
+            return []
+        if val.startswith("["):
+            try:
+                parsed = _ast.literal_eval(val)
+                if isinstance(parsed, (list, tuple)):
+                    val = parsed
+            except (ValueError, SyntaxError):
+                pass
+        if isinstance(val, str):  # still a string after attempted parse
+            return [val] if "<" not in val else []
+    # List / tuple / numpy array
+    if hasattr(val, "__iter__"):
+        return [
+            str(item)
+            for item in val
+            if item is not None and str(item).strip() and "<" not in str(item)
+        ]
+    return []
+
+
 def render_card(row: dict, target_label: str) -> None:
     import html as _html
 
     sim_pct = int(row["similarity"] * 100)
     bar_width = min(sim_pct, 100)
-    genres = row.get("genres") or []
-    moods = row.get("mood_tags") or []
+    genres = _safe_list(row.get("genres"))
+    moods  = _safe_list(row.get("mood_tags"))
 
     genre_html = (
-        "".join(f'<span class="genre-tag">{_html.escape(g.title())}</span>' for g in genres)
+        "".join(f'<span class="genre-tag">{_html.escape(str(g).title())}</span>' for g in genres)
         if genres
         else '<span style="color:#94a3b8;font-size:0.75rem;">no genres tagged</span>'
     )
 
     mood_html = (
-        "".join(f'<span class="mood-tag">✦ {_html.escape(m)}</span>' for m in moods)
+        "".join(f'<span class="mood-tag">✦ {_html.escape(str(m))}</span>' for m in moods)
         if moods
         else ""
     )
@@ -235,10 +287,10 @@ def render_card(row: dict, target_label: str) -> None:
     else:
         sent_html = ""
 
-    explanation = (row.get("explanation") or "").strip()
+    explanation = _html.escape((row.get("explanation") or "").strip())
     explanation_html = (
         f'<div class="explanation">💡 {explanation}</div>'
-        if explanation and explanation != "(explanation unavailable)"
+        if explanation and explanation != _html.escape("(explanation unavailable)")
         else ""
     )
 
@@ -261,6 +313,34 @@ def render_card(row: dict, target_label: str) -> None:
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+@st.cache_data(show_spinner=False)
+def cached_query(
+    titles: tuple[str, ...],
+    source_domain: str,
+    weights: tuple[float, ...],
+    top_k: int,
+    apply_genre_boost: bool,
+    apply_sentiment_filter: bool,
+    explain: bool,
+) -> pd.DataFrame:
+    """Thin cacheable wrapper around engine.query().
+
+    ``@st.cache_data`` keys on the arguments, so identical searches
+    (including Streamlit reruns from UI interaction) hit local memory
+    instead of calling Gemini again.
+    """
+    engine = load_engine()
+    return engine.query(
+        titles=list(titles),
+        source_domain=source_domain,
+        weights=list(weights),
+        top_k=top_k,
+        apply_genre_boost=apply_genre_boost,
+        apply_sentiment_filter=apply_sentiment_filter,
+        explain=explain,
+    )
+
+
 def main() -> None:
 
     # Hero header
@@ -269,7 +349,7 @@ def main() -> None:
         <span class="vibe-dot"></span>
         <span class="wordmark">VibeMatcher</span>
     </div>
-    <div class="hero-title">Find your next<br>favourite.</div>
+    <div class="hero-title">Find your next<br>obsession.</div>
     <div class="hero-sub">
         Type a movie and discover books with the same vibe — or the other way around.
     </div>
@@ -366,15 +446,14 @@ def main() -> None:
         weights = [w1, round(1.0 - w1, 2)]
 
     # Run query
-    engine = load_engine()
     target_label = "Book" if source_domain == "Movie" else "Movie"
 
     with st.spinner(f"Searching for {target_label.lower()} matches…"):
         try:
-            results = engine.query(
-                titles=titles,
+            results = cached_query(
+                titles=tuple(titles),
                 source_domain=source_domain.lower(),
-                weights=weights,
+                weights=tuple(weights),
                 top_k=top_k,
                 apply_genre_boost=genre_boost,
                 apply_sentiment_filter=sentiment,
@@ -383,6 +462,15 @@ def main() -> None:
         except Exception as exc:
             st.error(f"Query failed: {exc}")
             st.stop()
+
+    if explain and "explanation" in results.columns:
+        failed = (results["explanation"] == "(explanation unavailable)").sum()
+        if failed > 0:
+            st.warning(
+                f"Gemini explanations failed for {failed}/{len(results)} result(s) "
+                "after 3 retries — showing recommendations without them. "
+                "This is usually transient (rate limit or response formatting); try again in a moment."
+            )
 
     if results.empty:
         st.info(
